@@ -1,18 +1,18 @@
 /*
  * ============================================================================
- *  FreeRTOS Demo — Mini Machine Controller (ESP-IDF)
+ *  FreeRTOS Demo - Mini Machine Controller (ESP-IDF)
  * ============================================================================
- *  Oru chinna project-la ELLA major FreeRTOS concept-um:
- *    1. Tasks (different priorities)        5. Mutex (shared data protect)
+ *  A single project demonstrating all major FreeRTOS concepts:
+ *    1. Tasks (different priorities)        5. Mutex (protect shared data)
  *    2. Scheduler / priority                6. ISR-safe API (...FromISR)
- *    3. Queue (task -> task data pass)       7. Task Notification (lightweight)
+ *    3. Queue (task -> task data passing)    7. Task Notification (lightweight)
  *    4. Binary + Counting Semaphore          8. vTaskDelayUntil (periodic)
  *                                            9. Critical Section
  *
- *  Idea: Oru "machine" — sensor value padikkum, control task process pannum,
- *  display task print pannum, button (ISR) emergency stop trigger pannum.
+ *  Idea: a "machine" that reads a sensor value, processes it in a control task,
+ *  prints it in a display task, and stops via a button (ISR) emergency stop.
  *
- *  Build: idle ESP-IDF project-la main/ folder-la idha podu, target ESP32.
+ *  Build: place this file in the main/ folder of an ESP-IDF project (ESP32).
  * ============================================================================
  */
 
@@ -27,16 +27,16 @@
 static const char *TAG = "MACHINE";
 
 #define BUTTON_GPIO      0            // boot button (emergency stop)
-#define RESOURCE_SLOTS   3            // counting semaphore — 3 "tool slots"
+#define RESOURCE_SLOTS   3            // counting semaphore - 3 "tool slots"
 
-/* ---- Handles (global, tasks share panna) ---- */
+/* ---- Handles (global, shared by tasks) ---- */
 static QueueHandle_t     sensor_queue;     // (3) Queue
 static SemaphoreHandle_t emergency_sem;    // (4) Binary semaphore (ISR -> task)
 static SemaphoreHandle_t tool_slots;       // (4) Counting semaphore
 static SemaphoreHandle_t state_mutex;      // (5) Mutex
 static TaskHandle_t      display_task_h;   // (7) Task notification target
 
-/* ---- Shared machine state (mutex-oda protect pannanum) ---- */
+/* ---- Shared machine state (must be protected by the mutex) ---- */
 typedef struct {
     int   current_speed;
     int   parts_done;
@@ -45,34 +45,34 @@ typedef struct {
 
 static machine_state_t g_state = { .current_speed = 0, .parts_done = 0, .running = true };
 
-/* ---- Critical-section-la protect panra global counter ---- */
+/* ---- Global counter protected by a critical section ---- */
 static volatile uint32_t g_isr_count = 0;
 static portMUX_TYPE isr_mux = portMUX_INITIALIZER_UNLOCKED;
 
 
 /* ============================================================================
- *  (6) ISR — Button press. ISR-la NORMAL API koodadhu, ...FromISR than.
+ *  (6) ISR - Button press. Only ...FromISR APIs are allowed inside an ISR.
  * ============================================================================ */
 static void IRAM_ATTR button_isr_handler(void *arg)
 {
     BaseType_t hp_task_woken = pdFALSE;
 
-    /* Critical section (ISR version) — shared counter safe-a update */
+    /* Critical section (ISR variant) - safely update the shared counter */
     portENTER_CRITICAL_ISR(&isr_mux);
     g_isr_count++;
     portEXIT_CRITICAL_ISR(&isr_mux);
 
-    /* (4)(6) Binary semaphore give — task-a wake pannu (signaling) */
+    /* (4)(6) Give a binary semaphore to wake the emergency task (signaling) */
     xSemaphoreGiveFromISR(emergency_sem, &hp_task_woken);
 
-    /* High-priority task wake aana-na, ISR mudinja udane switch pannu */
+    /* If a higher-priority task was woken, switch to it as the ISR exits */
     portYIELD_FROM_ISR(hp_task_woken);
 }
 
 
 /* ============================================================================
- *  (8) SENSOR TASK — periodic, vTaskDelayUntil (exact 500ms period)
- *  Sensor value read panni queue-la podum (producer)
+ *  (8) SENSOR TASK - periodic with vTaskDelayUntil (exact 500 ms period).
+ *  Reads a sensor value and pushes it into the queue (producer).
  * ============================================================================ */
 static void sensor_task(void *arg)
 {
@@ -82,46 +82,46 @@ static void sensor_task(void *arg)
     while (1) {
         reading = (reading + 10) % 100;          // fake sensor value
 
-        /* (3) Queue-la podu — control task edukkum */
+        /* (3) Push into the queue - the control task will consume it */
         if (xQueueSend(sensor_queue, &reading, pdMS_TO_TICKS(10)) != pdTRUE) {
             ESP_LOGW(TAG, "Sensor queue full!");
         }
 
-        /* (8) vTaskDelayUntil — drift illama exact 500ms period.
-         * (vTaskDelay use panna, execution time-um sேrndhu drift aagum) */
+        /* (8) vTaskDelayUntil - exact 500 ms period with no drift.
+         * (vTaskDelay would add the execution time and drift over time.) */
         vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(500));
     }
 }
 
 
 /* ============================================================================
- *  CONTROL TASK — queue-la irundhu edukkum (consumer), state update,
- *  display task-ku notify pannum
+ *  CONTROL TASK - consumes from the queue, updates the shared state, and
+ *  notifies the display task.
  * ============================================================================ */
 static void control_task(void *arg)
 {
     int reading;
 
     while (1) {
-        /* (3) Queue-la data varum varaikkum block aagum (CPU waste illa) */
+        /* (3) Block until data is available (no busy-waiting / CPU waste) */
         if (xQueueReceive(sensor_queue, &reading, portMAX_DELAY) == pdTRUE) {
 
-            /* (4) Counting semaphore — "tool slot" edukka try pannu.
-             * 3 slot than, over-a use pannaama limit pannum */
+            /* (4) Counting semaphore - acquire a "tool slot".
+             * Only 3 slots exist, which limits concurrent usage. */
             if (xSemaphoreTake(tool_slots, pdMS_TO_TICKS(100)) == pdTRUE) {
 
-                /* (5) Mutex — shared state-a protect panni update pannu */
+                /* (5) Mutex - protect the shared state while updating */
                 if (xSemaphoreTake(state_mutex, portMAX_DELAY) == pdTRUE) {
                     g_state.current_speed = reading;
                     g_state.parts_done++;
-                    xSemaphoreGive(state_mutex);       // mutex-a thிரump kudu
+                    xSemaphoreGive(state_mutex);       // release the mutex
                 }
 
-                vTaskDelay(pdMS_TO_TICKS(50));         // "processing" time
-                xSemaphoreGive(tool_slots);            // slot-a release pannu
+                vTaskDelay(pdMS_TO_TICKS(50));         // simulated processing time
+                xSemaphoreGive(tool_slots);            // release the slot
 
-                /* (7) Task Notification — display task-a wake pannu.
-                 * Semaphore vida lightweight + fast */
+                /* (7) Task Notification - wake the display task.
+                 * Lighter and faster than a semaphore. */
                 xTaskNotifyGive(display_task_h);
             }
         }
@@ -130,16 +130,16 @@ static void control_task(void *arg)
 
 
 /* ============================================================================
- *  (7) DISPLAY TASK — notification varum varaikkum wait, state print
+ *  (7) DISPLAY TASK - waits for a notification, then prints the state.
  * ============================================================================ */
 static void display_task(void *arg)
 {
     while (1) {
-        /* (7) Notification varum varaikkum block (LVGL update maadhiri) */
+        /* (7) Block until notified (similar to refreshing an LVGL screen) */
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
         machine_state_t snapshot;
-        /* (5) Mutex — read panra pothum protect (consistent snapshot) */
+        /* (5) Mutex - protect the state while reading (consistent snapshot) */
         if (xSemaphoreTake(state_mutex, portMAX_DELAY) == pdTRUE) {
             snapshot = g_state;
             xSemaphoreGive(state_mutex);
@@ -152,12 +152,12 @@ static void display_task(void *arg)
 
 
 /* ============================================================================
- *  EMERGENCY TASK — button ISR semaphore-ku wait, machine stop
+ *  EMERGENCY TASK - waits for the button ISR semaphore, then stops the machine.
  * ============================================================================ */
 static void emergency_task(void *arg)
 {
     while (1) {
-        /* (4) Binary semaphore — ISR give pannum varaikkum block */
+        /* (4) Binary semaphore - block until the ISR gives it */
         if (xSemaphoreTake(emergency_sem, portMAX_DELAY) == pdTRUE) {
 
             if (xSemaphoreTake(state_mutex, portMAX_DELAY) == pdTRUE) {
@@ -173,18 +173,18 @@ static void emergency_task(void *arg)
 
 
 /* ============================================================================
- *  app_main — ellathaiyum create panni scheduler-a start pannu
+ *  app_main - create everything and let the scheduler run.
  * ============================================================================ */
 void app_main(void)
 {
-    /* ---- (3)(4)(5) Kernel objects create ---- */
-    sensor_queue  = xQueueCreate(5, sizeof(int));      // 5 int hold pannum
+    /* ---- (3)(4)(5) Create kernel objects ---- */
+    sensor_queue  = xQueueCreate(5, sizeof(int));      // holds up to 5 ints
     emergency_sem = xSemaphoreCreateBinary();          // binary
     tool_slots    = xSemaphoreCreateCounting(RESOURCE_SLOTS, RESOURCE_SLOTS);
     state_mutex   = xSemaphoreCreateMutex();           // mutex (priority inheritance)
 
     if (!sensor_queue || !emergency_sem || !tool_slots || !state_mutex) {
-        ESP_LOGE(TAG, "Kernel object create fail!");
+        ESP_LOGE(TAG, "Failed to create kernel objects!");
         return;
     }
 
@@ -199,14 +199,14 @@ void app_main(void)
     gpio_install_isr_service(0);
     gpio_isr_handler_add(BUTTON_GPIO, button_isr_handler, NULL);
 
-    /* ---- (1)(2) Tasks create — different PRIORITIES (number periisu = high) ----
-     * emergency (4) > control (3) > display (2) > sensor (2)
-     * Preemptive scheduler high-priority ready task-a udane run pannum */
+    /* ---- (1)(2) Create tasks with different PRIORITIES (higher number = higher) ----
+     * emergency (4) > control (3) > display (2) = sensor (2)
+     * The preemptive scheduler runs the highest-priority ready task. */
     xTaskCreate(sensor_task,    "sensor",    2048, NULL, 2, NULL);
     xTaskCreate(control_task,   "control",   2048, NULL, 3, NULL);
     xTaskCreate(display_task,   "display",   2048, NULL, 2, &display_task_h);
     xTaskCreate(emergency_task, "emergency", 2048, NULL, 4, NULL);
 
     ESP_LOGI(TAG, "Machine started. Press BOOT button = emergency stop.");
-    /* app_main return aanalum tasks run aagum — scheduler already ODUthu */
+    /* Tasks keep running even after app_main returns - the scheduler is active */
 }
